@@ -3,6 +3,7 @@ import json
 import time
 import random
 import html
+import re
 from datetime import datetime
 
 import telebot
@@ -18,6 +19,29 @@ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH_CONFIG  = os.path.join(DATA_DIR, "config.json")
 PATH_REVIEWS = os.path.join(DATA_DIR, "reviews.json")
 PATH_ORDERS  = os.path.join(DATA_DIR, "orders.json")
+
+# ===== ULTRA PRO v3 storage =====
+PATH_PROMO   = os.path.join(DATA_DIR, "promo.json")
+PATH_SPIN    = os.path.join(DATA_DIR, "spin.json")
+PATH_STATS   = os.path.join(DATA_DIR, "promo_stats.json")
+PATH_LOYALTY = os.path.join(DATA_DIR, "loyalty.json")
+
+# ===== ULTRA PRO v3 settings =====
+PROMO_MIN_ORDER = 500          # мин. сумма заказа для промокода (по числу из "Бюджет")
+PROMO_TTL_SEC   = 24 * 3600    # промокод живёт 24ч
+SPIN_TTL_SEC    = 24 * 3600    # 1 раз в 24ч
+# шанс: 0% 55%, 5% 30%, 10% 12%, 20% 3%
+SPIN_THRESHOLDS = [(3, 20), (15, 10), (45, 5)]  # <=3 =>20, <=15=>10, <=45=>5, else 0
+
+# loyalty
+STAMP_PER_ORDER = 1
+STAMPS_FOR_REWARD = 10
+LOYALTY_LEVELS = [
+    (0,   "BRONZE"),
+    (5,   "SILVER"),
+    (12,  "GOLD"),
+    (25,  "VIP"),
+]
 
 FLOOD_DELAY = 0.35
 _last_action = {}
@@ -83,13 +107,9 @@ def safe_delete(chat_id: int, message_id: int):
         pass
 
 def delete_user_message(message):
-    # удаляем входящее сообщение пользователя (чистим чат)
     safe_delete(message.chat.id, message.message_id)
 
 def parse_chat_target(val):
-    """
-    Возвращает int для -100... или строку для @username
-    """
     if val is None:
         return None
     s = str(val).strip()
@@ -102,19 +122,188 @@ def parse_chat_target(val):
             return s
     return s
 
+def extract_amount(text: str) -> int:
+    """
+    Достаём первое число из "Бюджет" (например: "1200 MDL" -> 1200)
+    Если нет числа -> 0
+    """
+    if not text:
+        return 0
+    m = re.search(r"(\d[\d\s]{0,12})", text)
+    if not m:
+        return 0
+    raw = m.group(1).replace(" ", "")
+    try:
+        return int(raw)
+    except Exception:
+        return 0
+
+# =========================
+# ULTRA PRO v3: PROMO + SPIN + LOYALTY
+# =========================
+def promo_load():
+    return ensure_list_schema(load_json(PATH_PROMO, []))
+
+def promo_save(data):
+    save_json(PATH_PROMO, data)
+
+def spin_load():
+    return load_json(PATH_SPIN, {})
+
+def spin_save(data):
+    save_json(PATH_SPIN, data)
+
+def stats_load():
+    return load_json(PATH_STATS, {"issued": 0, "used": 0, "saved_money": 0, "no_win": 0})
+
+def stats_save(data):
+    save_json(PATH_STATS, data)
+
+def loyalty_load():
+    return load_json(PATH_LOYALTY, {})  # user_id(str) -> {...}
+
+def loyalty_save(data):
+    save_json(PATH_LOYALTY, data)
+
+def loyalty_get(uid: int):
+    allv = loyalty_load()
+    u = allv.get(str(uid)) or {"stamps": 0, "orders": 0, "updated": now_iso()}
+    return allv, u
+
+def loyalty_level(stamps: int) -> str:
+    lvl = "BRONZE"
+    for threshold, name in LOYALTY_LEVELS:
+        if stamps >= threshold:
+            lvl = name
+    return lvl
+
+def loyalty_add_order(uid: int):
+    allv, u = loyalty_get(uid)
+    u["orders"] = int(u.get("orders", 0)) + 1
+    u["stamps"] = int(u.get("stamps", 0)) + STAMP_PER_ORDER
+    u["updated"] = now_iso()
+    allv[str(uid)] = u
+    loyalty_save(allv)
+    return u
+
+def promo_random_discount():
+    r = random.randint(1, 100)
+    for thr, disc in SPIN_THRESHOLDS:
+        if r <= thr:
+            return disc
+    return 0
+
+def promo_generate_code(discount: int):
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    rand = ''.join(random.choices(chars, k=6))
+    return f"TRX{discount}_{rand}"
+
+def promo_can_spin(uid: int) -> bool:
+    spins = spin_load()
+    now = int(time.time())
+    last = spins.get(str(uid))
+    if last and now - int(last) < SPIN_TTL_SEC:
+        return False
+    spins[str(uid)] = now
+    spin_save(spins)
+    return True
+
+def promo_create(uid: int, discount: int) -> str:
+    promos = promo_load()
+    stats = stats_load()
+
+    code = promo_generate_code(discount)
+    expire = int(time.time()) + PROMO_TTL_SEC
+
+    promos.append({
+        "code": code,
+        "user_id": uid,
+        "discount": discount,
+        "expire": expire,
+        "used": False,
+        "created": now_iso()
+    })
+    promo_save(promos)
+
+    stats["issued"] += 1
+    stats_save(stats)
+    return code
+
+def promo_find(code: str):
+    promos = promo_load()
+    for i, p in enumerate(promos):
+        if p.get("code") == code:
+            return i, p, promos
+    return None, None, promos
+
+def promo_validate_for_order(code: str, uid: int, order_sum: int):
+    idx, p, promos = promo_find(code)
+    if p is None:
+        return False, "❌ Код не найден", None
+    if int(p.get("user_id", 0)) != int(uid):
+        return False, "❌ Это не твой промокод", None
+    if p.get("used"):
+        return False, "❌ Уже использован", None
+    if time.time() > int(p.get("expire", 0)):
+        return False, "❌ Просрочен", None
+    if order_sum < PROMO_MIN_ORDER:
+        return False, f"❌ Минимальная сумма заказа: {PROMO_MIN_ORDER}", None
+    return True, "OK", p
+
+def promo_mark_used(code: str, order_sum: int) -> tuple[int, int]:
+    idx, p, promos = promo_find(code)
+    if p is None:
+        return 0, 0
+    if p.get("used"):
+        return 0, 0
+    p["used"] = True
+    promos[idx] = p
+    promo_save(promos)
+
+    disc = int(p.get("discount", 0))
+    saved = int(order_sum * disc / 100)
+
+    stats = stats_load()
+    stats["used"] += 1
+    stats["saved_money"] += saved
+    stats_save(stats)
+    return disc, saved
+
+def spin_animation(chat_id: int):
+    """
+    Фейк-анимация колеса: быстро редактируем сообщение.
+    Не спамит чат, просто меняет текст.
+    """
+    frames = [
+        "🎰 Крутим…\n🟩🟨🟥🟦",
+        "🎰 Крутим…\n🟥🟦🟩🟨",
+        "🎰 Крутим…\n🟨🟥🟦🟩",
+        "🎰 Крутим…\n🟦🟩🟨🟥",
+        "🎰 Крутим…\n🟩🟦🟥🟨",
+        "🎰 Крутим…\n🟥🟨🟩🟦",
+    ]
+    msg = bot.send_message(chat_id, frames[0])
+    for f in frames[1:]:
+        time.sleep(0.15)
+        try:
+            bot.edit_message_text(f, chat_id=chat_id, message_id=msg.message_id, parse_mode="HTML")
+        except Exception:
+            pass
+    time.sleep(0.15)
+    return msg.message_id
+
 # =========================
 # CONFIG STORAGE
 # =========================
 def get_config():
     default = {
-        "shop_link": "https://t.me/tr1xaelshopbot",     # просто показываем текстом
-        "support_link": "https://t.me/tr1xADMIN",       # менеджер
+        "shop_link": "https://t.me/tr1xaelshopbot",
+        "support_link": "https://t.me/tr1xADMIN",
         "help_text": (
             "• По заказам — напишите менеджеру.\n"
             "• Индивидуальный заказ — через «📦 Инд. заказ».\n"
             "• Возврат/обмен — опишите проблему и приложите фото."
         ),
-        # куда слать отзывы (chat_id -100... или @channel)
         "reviews_forward_chat": "-1003572348203",
         "reviews_forward_template": "⭐ <b>Отзыв</b>\nОт: {who}\nДата: {date}\n\n{text}",
     }
@@ -134,18 +323,14 @@ def set_config_key(key, value):
 # =========================
 def kb_reply_main(user_id: int):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    # порядок: инд заказ -> отзыв -> помощь
     kb.row("📦 Инд. заказ", "📝 Отзыв")
     kb.row("🆘 Помощь")
+    kb.row("🎁 Скидка сегодня", "⭐ Лояльность")  # ✅ ULTRA PRO v3 buttons
     if is_admin(user_id):
         kb.row("👑 Админка")
     return kb
 
 def ensure_reply_menu(chat_id: int, user_id: int):
-    """
-    Держим отдельное сообщение, которое "несёт" ReplyKeyboard.
-    Его не удаляем — иначе меню снизу пропадёт.
-    """
     if chat_id in MENU_CARRIER:
         return
     msg = bot.send_message(chat_id, MENU_TEXT, reply_markup=kb_reply_main(user_id))
@@ -159,6 +344,8 @@ def kb_inline_main(user_id: int):
     kb.add(types.InlineKeyboardButton("📦 Инд. заказ", callback_data="go_order"))
     kb.add(types.InlineKeyboardButton("📝 Отзыв", callback_data="go_review"))
     kb.add(types.InlineKeyboardButton("🆘 Помощь", callback_data="go_help"))
+    kb.add(types.InlineKeyboardButton("🎁 Скидка сегодня", callback_data="go_spin"))
+    kb.add(types.InlineKeyboardButton("⭐ Лояльность", callback_data="go_loyalty"))
     if is_admin(user_id):
         kb.add(types.InlineKeyboardButton("👑 Админка", callback_data="go_admin"))
     return kb
@@ -240,6 +427,14 @@ def kb_confirm():
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="order_cancel"))
     return kb
 
+# ULTRA: promo in order
+def kb_promo_choice():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✅ Ввести промокод", callback_data="promo:manual"))
+    kb.add(types.InlineKeyboardButton("⏭ Пропустить", callback_data="promo:skip"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="order_cancel"))
+    return kb
+
 # ----- Admin UI -----
 def kb_admin():
     kb = types.InlineKeyboardMarkup()
@@ -274,10 +469,6 @@ def kb_admin_order_actions(order_id: str):
 # UI SHOW (всегда один экран)
 # =========================
 def ui_show(chat_id: int, text: str, reply_markup=None, edit_message_id=None, disable_preview=True):
-    """
-    1) Пытаемся отредактировать прошлый экран
-    2) Если не получилось — удаляем прошлый экран и шлём новый
-    """
     mid = edit_message_id or LAST_UI_MSG.get(chat_id)
     if mid:
         try:
@@ -292,7 +483,6 @@ def ui_show(chat_id: int, text: str, reply_markup=None, edit_message_id=None, di
             LAST_UI_MSG[chat_id] = mid
             return mid
         except Exception:
-            # если редактирование не вышло — удалим прошлый экран, чтобы не плодить мусор
             safe_delete(chat_id, mid)
 
     msg = bot.send_message(
@@ -346,7 +536,6 @@ def forward_review_to_channel(entry: dict):
             out = template.format(who=who, date=date, text=txt)
             bot.send_message(target, out, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        # пишем админам точную ошибку
         for admin_id in ADMINS:
             try:
                 bot.send_message(int(admin_id), f"❌ Ошибка отправки отзыва в {esc(str(target_raw))}\n<code>{esc(str(e))}</code>")
@@ -400,11 +589,32 @@ def section_review(chat_id: int, user_id: int, edit_id=None):
         disable_preview=True
     )
 
+def section_loyalty(chat_id: int, user_id: int, edit_id=None):
+    ensure_reply_menu(chat_id, user_id)
+    allv, u = loyalty_get(user_id)
+    stamps = int(u.get("stamps", 0))
+    orders = int(u.get("orders", 0))
+    lvl = loyalty_level(stamps)
+    left = max(0, STAMPS_FOR_REWARD - (stamps % STAMPS_FOR_REWARD))
+    ui_show(
+        chat_id,
+        "<b>⭐ Лояльность</b>\n\n"
+        f"<b>Уровень:</b> {esc(lvl)}\n"
+        f"<b>Заказов:</b> {orders}\n"
+        f"<b>Наклеек:</b> {stamps}\n\n"
+        f"До подарка: <b>{left}</b> наклеек (порог {STAMPS_FOR_REWARD}).\n"
+        "Наклейка начисляется за подтверждённый заказ.",
+        reply_markup=kb_back_main(),
+        edit_message_id=edit_id,
+        disable_preview=True
+    )
+
 def section_admin(chat_id: int, user_id: int, edit_id=None):
     ensure_reply_menu(chat_id, user_id)
     if not is_admin(user_id):
         return ui_show(chat_id, "Доступ запрещён.", reply_markup=kb_back_main(), edit_message_id=edit_id)
-    ui_show(chat_id, "<b>👑 Админка</b>", reply_markup=kb_admin(), edit_message_id=edit_id)
+    ui_show(chat_id, "<b>👑 Админка</b>\n\nКоманды:\n/promo_stats\n/promo_list\n/loyalty_top",
+            reply_markup=kb_admin(), edit_message_id=edit_id)
 
 # =========================
 # ORDER WIZARD
@@ -430,13 +640,17 @@ def start_order(chat_id: int, user, edit_id=None):
         "city": "",
         "contact": "",
         "note": "",
-        "photo_file_id": None
+        "photo_file_id": None,
+        # ULTRA PRO v3 fields
+        "promo_code": "",
+        "promo_discount": 0,
+        "promo_saved": 0,
     }
     set_state(user.id, "order_model", data)
     ui_show(
         chat_id,
         "<b>📦 Индивидуальный заказ</b>\n\n"
-        "Шаг 1/9: Напишите <b>модель / название вещи</b>.\n"
+        "Шаг 1/10: Напишите <b>модель / название вещи</b>.\n"
         "Пример: <i>Худи Oversize / карго / футболка</i>",
         reply_markup=kb_cancel(),
         edit_message_id=edit_id,
@@ -453,6 +667,9 @@ def status_label(s: str) -> str:
 
 def order_preview(user, d: dict) -> str:
     uname = f"@{user.username}" if user.username else "(без username)"
+    promo_line = "—"
+    if d.get("promo_code"):
+        promo_line = f"{d.get('promo_discount')}% / {esc(d.get('promo_code'))}"
     return (
         "<b>✅ Проверьте заявку</b>\n\n"
         f"<b>ID:</b> <code>{esc(d.get('order_id'))}</code>\n"
@@ -464,6 +681,7 @@ def order_preview(user, d: dict) -> str:
         f"<b>Цвет:</b> {esc(d.get('color'))}\n"
         f"<b>Кол-во:</b> {esc(d.get('qty'))}\n"
         f"<b>Бюджет:</b> {esc(d.get('budget'))}\n"
+        f"<b>Промокод:</b> {promo_line}\n"
         f"<b>Город/доставка:</b> {esc(d.get('city'))}\n"
         f"<b>Контакт:</b> {esc(d.get('contact'))}\n"
         f"<b>Комментарий:</b> {esc(d.get('note') or '—')}\n"
@@ -507,6 +725,51 @@ def cmd_admin(message):
     delete_user_message(message)
     section_admin(message.chat.id, message.from_user.id)
 
+# ULTRA: admin commands
+@bot.message_handler(commands=["promo_stats"])
+def cmd_promo_stats(message):
+    if not is_admin(message.from_user.id):
+        return
+    s = stats_load()
+    bot.send_message(
+        message.chat.id,
+        "📊 <b>Promo stats</b>\n\n"
+        f"Выдано: <b>{s.get('issued',0)}</b>\n"
+        f"Использовано: <b>{s.get('used',0)}</b>\n"
+        f"Без выигрыша: <b>{s.get('no_win',0)}</b>\n"
+        f"Скидок на сумму: <b>{s.get('saved_money',0)}</b>",
+        disable_web_page_preview=True
+    )
+
+@bot.message_handler(commands=["promo_list"])
+def cmd_promo_list(message):
+    if not is_admin(message.from_user.id):
+        return
+    promos = promo_load()
+    if not promos:
+        return bot.send_message(message.chat.id, "Нет промокодов")
+    out = "🎟 <b>Последние промокоды</b>\n\n"
+    for p in promos[-25:]:
+        out += (
+            f"<code>{esc(p.get('code',''))}</code> | {int(p.get('discount',0))}% | "
+            f"user:{p.get('user_id')} | used:{p.get('used')}\n"
+        )
+    bot.send_message(message.chat.id, out)
+
+@bot.message_handler(commands=["loyalty_top"])
+def cmd_loyalty_top(message):
+    if not is_admin(message.from_user.id):
+        return
+    allv = loyalty_load()
+    rows = []
+    for uid_s, u in allv.items():
+        rows.append((int(u.get("stamps",0)), int(u.get("orders",0)), uid_s))
+    rows.sort(reverse=True)
+    out = "⭐ <b>ТОП лояльности</b>\n\n"
+    for stamps, orders, uid_s in rows[:20]:
+        out += f"user:{uid_s} | stamps:{stamps} | orders:{orders} | lvl:{loyalty_level(stamps)}\n"
+    bot.send_message(message.chat.id, out)
+
 # =========================
 # CALLBACKS
 # =========================
@@ -536,6 +799,37 @@ def callbacks(call):
     if data == "go_order":
         return start_order(chat_id, call.from_user, edit_id=call.message.message_id)
 
+    if data == "go_loyalty":
+        clear_state(uid)
+        return section_loyalty(chat_id, uid, edit_id=call.message.message_id)
+
+    if data == "go_spin":
+        # крутилка по inline-кнопке
+        clear_state(uid)
+        if not promo_can_spin(uid):
+            return ui_show(chat_id, "😎 Ты уже крутил сегодня. Попробуй завтра.", reply_markup=kb_back_main(),
+                           edit_message_id=call.message.message_id)
+        anim_mid = spin_animation(chat_id)
+        discount = promo_random_discount()
+        if discount == 0:
+            s = stats_load()
+            s["no_win"] = int(s.get("no_win",0)) + 1
+            stats_save(s)
+            try:
+                bot.edit_message_text("😢 Сегодня без скидки. Приходи завтра.", chat_id=chat_id, message_id=anim_mid)
+            except Exception:
+                bot.send_message(chat_id, "😢 Сегодня без скидки. Приходи завтра.")
+            return
+        code = promo_create(uid, discount)
+        try:
+            bot.edit_message_text(
+                f"🔥 Твоя скидка <b>{discount}%</b>\nПромокод:\n<code>{code}</code>\nДействует 24 часа.",
+                chat_id=chat_id, message_id=anim_mid, parse_mode="HTML"
+            )
+        except Exception:
+            bot.send_message(chat_id, f"🔥 Твоя скидка {discount}%\n<code>{code}</code>")
+        return
+
     if data == "go_admin":
         return section_admin(chat_id, uid, edit_id=call.message.message_id)
 
@@ -557,7 +851,7 @@ def callbacks(call):
                            reply_markup=kb_cancel(), edit_message_id=call.message.message_id)
         st["data"]["size"] = choice
         set_state(uid, "order_color", st["data"])
-        return ui_show(chat_id, "Шаг 4/9: Выберите <b>цвет</b>:", reply_markup=kb_color(),
+        return ui_show(chat_id, "Шаг 4/10: Выберите <b>цвет</b>:", reply_markup=kb_color(),
                        edit_message_id=call.message.message_id)
 
     if data.startswith("color:"):
@@ -572,7 +866,7 @@ def callbacks(call):
                            edit_message_id=call.message.message_id)
         st["data"]["color"] = choice
         set_state(uid, "order_qty", st["data"])
-        return ui_show(chat_id, "Шаг 5/9: Выберите <b>количество</b>:", reply_markup=kb_qty(),
+        return ui_show(chat_id, "Шаг 5/10: Выберите <b>количество</b>:", reply_markup=kb_qty(),
                        edit_message_id=call.message.message_id)
 
     if data.startswith("qty:"):
@@ -587,8 +881,23 @@ def callbacks(call):
                            edit_message_id=call.message.message_id)
         st["data"]["qty"] = choice
         set_state(uid, "order_budget", st["data"])
-        return ui_show(chat_id, "Шаг 6/9: Укажите <b>бюджет</b> (пример: 1200 MDL / $60):",
+        return ui_show(chat_id, "Шаг 6/10: Укажите <b>бюджет</b> (пример: 1200 MDL / $60):",
                        reply_markup=kb_cancel(), edit_message_id=call.message.message_id)
+
+    # ULTRA: promo choice callbacks
+    if data.startswith("promo:"):
+        st = get_state(uid)
+        if st["mode"] != "order_promo_choice":
+            return
+        action = data.split(":", 1)[1]
+        if action == "skip":
+            set_state(uid, "order_city", st["data"])
+            return ui_show(chat_id, "Шаг 8/10: <b>Город/доставка</b> (пример: Кишинёв / самовывоз):",
+                           reply_markup=kb_cancel(), edit_message_id=call.message.message_id)
+        if action == "manual":
+            set_state(uid, "order_promo_manual", st["data"])
+            return ui_show(chat_id, "Введите промокод (пример: TRX10_ABC123):", reply_markup=kb_cancel(),
+                           edit_message_id=call.message.message_id)
 
     if data.startswith("contact:"):
         st = get_state(uid)
@@ -599,7 +908,7 @@ def callbacks(call):
             uname = f"@{call.from_user.username}" if call.from_user.username else ""
             st["data"]["contact"] = uname
             set_state(uid, "order_note", st["data"])
-            return ui_show(chat_id, "Шаг 9/9: Комментарий (необязательно). Напишите детали или отправьте «-».",
+            return ui_show(chat_id, "Шаг 10/10: Комментарий (необязательно). Напишите детали или отправьте «-».",
                            reply_markup=kb_cancel(), edit_message_id=call.message.message_id)
         if action == "manual":
             st["data"]["contact"] = ""
@@ -619,9 +928,30 @@ def callbacks(call):
         st = get_state(uid)
         if st["mode"] != "order_confirm":
             return
+
+        # ULTRA: apply promo on confirm
+        order_sum = extract_amount(st["data"].get("budget",""))
+        if st["data"].get("promo_code"):
+            ok, msg, p = promo_validate_for_order(st["data"]["promo_code"], uid, order_sum)
+            if ok:
+                disc, saved = promo_mark_used(st["data"]["promo_code"], order_sum)
+                st["data"]["promo_discount"] = disc
+                st["data"]["promo_saved"] = saved
+            else:
+                # если код стал невалидным — просто убираем
+                st["data"]["promo_code"] = ""
+                st["data"]["promo_discount"] = 0
+                st["data"]["promo_saved"] = 0
+
         persist_order(st["data"])
 
-        ui_show(chat_id, "✅ Заявка отправлена. Менеджер свяжется с вами.", reply_markup=kb_back_main(),
+        # ULTRA: loyalty on confirm
+        u = loyalty_add_order(uid)
+
+        ui_show(chat_id,
+                "✅ Заявка отправлена. Менеджер свяжется с вами.\n\n"
+                f"⭐ Лояльность: наклеек теперь <b>{int(u.get('stamps',0))}</b> (уровень {esc(loyalty_level(int(u.get('stamps',0))))}).",
+                reply_markup=kb_back_main(),
                 edit_message_id=call.message.message_id)
 
         admin_text = "<b>📦 Новый индивидуальный заказ</b>\n\n" + order_preview(call.from_user, st["data"])
@@ -646,6 +976,9 @@ def callbacks(call):
         if not new_orders:
             return bot.send_message(chat_id, "Новых заказов нет.", reply_markup=kb_admin())
         for o in new_orders[-10:]:
+            promo_line = "—"
+            if o.get("promo_code"):
+                promo_line = f"{o.get('promo_discount',0)}% / {esc(o.get('promo_code'))} (save {o.get('promo_saved',0)})"
             full = (
                 f"<b>{status_label(o.get('status'))}</b>\n"
                 f"<b>ID:</b> <code>{esc(o.get('order_id'))}</code>\n"
@@ -656,6 +989,7 @@ def callbacks(call):
                 f"<b>Цвет:</b> {esc(o.get('color'))}\n"
                 f"<b>Кол-во:</b> {esc(o.get('qty'))}\n"
                 f"<b>Бюджет:</b> {esc(o.get('budget'))}\n"
+                f"<b>Промокод:</b> {promo_line}\n"
                 f"<b>Город:</b> {esc(o.get('city'))}\n"
                 f"<b>Контакт:</b> {esc(o.get('contact'))}\n"
                 f"<b>Комментарий:</b> {esc(o.get('note') or '—')}\n"
@@ -734,7 +1068,7 @@ def callbacks(call):
         if not is_admin(uid):
             return
         set_state(uid, "admin_wait_reviews_channel", {})
-        bot.send_message(chat_id, "Отправьте канал для отзывов: @username или -1003572348203\nБот должен быть админом и иметь право постить.")
+        bot.send_message(chat_id, "Отправьте канал для отзывов: @username или -100...\nБот должен быть админом и иметь право постить.")
         return
 
     if data.startswith("st:"):
@@ -759,6 +1093,35 @@ def callbacks(call):
         except Exception:
             pass
         return
+# =========================
+# 🔥 MINI APP LINK (ULTRA PRO)
+# =========================
+@bot.message_handler(content_types=["web_app_data"])
+def webapp_handler(message):
+    print("WEBAPP DATA:", message.web_app_data.data)  # 👈 добавь
+
+    try:
+        data = json.loads(message.web_app_data.data)
+    except:
+        return
+
+def webapp_handler(message):
+    try:
+        data = json.loads(message.web_app_data.data)
+    except:
+        return
+
+    if data.get("type") == "miniapp_order":
+        uid = message.from_user.id
+
+        # начисляем наклейку
+        u = loyalty_add_order(uid)
+
+        bot.send_message(
+            message.chat.id,
+            f"⭐ За заказ в mini-app начислена наклейка!\n"
+            f"Теперь у тебя: {u['stamps']} наклеек"
+        )
 
 # =========================
 # TEXT ROUTER
@@ -770,7 +1133,6 @@ def text_router(message):
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
-    # чистим сообщения пользователя
     delete_user_message(message)
 
     st = get_state(uid)
@@ -813,6 +1175,9 @@ def text_router(message):
         idx, o, _ = find_order(order_id)
         if o is None:
             return bot.send_message(chat_id, "Не найдено. Проверь ID.", reply_markup=kb_admin())
+        promo_line = "—"
+        if o.get("promo_code"):
+            promo_line = f"{o.get('promo_discount',0)}% / {esc(o.get('promo_code'))} (save {o.get('promo_saved',0)})"
         full = (
             f"<b>{status_label(o.get('status'))}</b>\n"
             f"<b>ID:</b> <code>{esc(o.get('order_id'))}</code>\n"
@@ -823,6 +1188,7 @@ def text_router(message):
             f"<b>Цвет:</b> {esc(o.get('color'))}\n"
             f"<b>Кол-во:</b> {esc(o.get('qty'))}\n"
             f"<b>Бюджет:</b> {esc(o.get('budget'))}\n"
+            f"<b>Промокод:</b> {promo_line}\n"
             f"<b>Город:</b> {esc(o.get('city'))}\n"
             f"<b>Контакт:</b> {esc(o.get('contact'))}\n"
             f"<b>Комментарий:</b> {esc(o.get('note') or '—')}\n"
@@ -848,10 +1214,7 @@ def text_router(message):
         }
         reviews.append(entry)
         save_json(PATH_REVIEWS, reviews)
-
-        # автопост в канал
         forward_review_to_channel(entry)
-
         clear_state(uid)
         ui_show(chat_id, "✅ Спасибо! Отзыв сохранён.", reply_markup=kb_back_main())
         return
@@ -860,50 +1223,70 @@ def text_router(message):
     if mode == "order_model":
         d["model"] = text
         set_state(uid, "order_brand", d)
-        ui_show(chat_id, "Шаг 2/9: Укажите <b>бренд</b> (пример: Nike / Stussy / Corteiz):",
+        ui_show(chat_id, "Шаг 2/10: Укажите <b>бренд</b> (пример: Nike / Stussy / Corteiz):",
                 reply_markup=kb_cancel())
         return
 
     if mode == "order_brand":
         d["brand"] = text
         set_state(uid, "order_size", d)
-        ui_show(chat_id, "Шаг 3/9: Выберите <b>размер</b>:", reply_markup=kb_size())
+        ui_show(chat_id, "Шаг 3/10: Выберите <b>размер</b>:", reply_markup=kb_size())
         return
 
     if mode == "order_size_manual":
         d["size"] = text
         set_state(uid, "order_color", d)
-        ui_show(chat_id, "Шаг 4/9: Выберите <b>цвет</b>:", reply_markup=kb_color())
+        ui_show(chat_id, "Шаг 4/10: Выберите <b>цвет</b>:", reply_markup=kb_color())
         return
 
     if mode == "order_color_manual":
         d["color"] = text
         set_state(uid, "order_qty", d)
-        ui_show(chat_id, "Шаг 5/9: Выберите <b>количество</b>:", reply_markup=kb_qty())
+        ui_show(chat_id, "Шаг 5/10: Выберите <b>количество</b>:", reply_markup=kb_qty())
         return
 
     if mode == "order_qty_manual":
         d["qty"] = text
         set_state(uid, "order_budget", d)
-        ui_show(chat_id, "Шаг 6/9: Укажите <b>бюджет</b> (пример: 1200 MDL / $60):", reply_markup=kb_cancel())
+        ui_show(chat_id, "Шаг 6/10: Укажите <b>бюджет</b> (пример: 1200 MDL / $60):", reply_markup=kb_cancel())
         return
 
     if mode == "order_budget":
         d["budget"] = text
+        # ULTRA: ask promo after budget
+        set_state(uid, "order_promo_choice", d)
+        ui_show(chat_id,
+                "Шаг 7/10: Есть <b>промокод</b>?\n"
+                f"Минимальная сумма для промокода: <b>{PROMO_MIN_ORDER}</b>",
+                reply_markup=kb_promo_choice())
+        return
+
+    # ULTRA: promo manual input
+    if mode == "order_promo_manual":
+        code = text.strip()
+        order_sum = extract_amount(d.get("budget",""))
+        ok, msg, p = promo_validate_for_order(code, uid, order_sum)
+        if not ok:
+            set_state(uid, "order_promo_choice", d)
+            ui_show(chat_id, f"{esc(msg)}\n\nПопробовать снова или пропустить:", reply_markup=kb_promo_choice())
+            return
+        d["promo_code"] = code
+        d["promo_discount"] = int(p.get("discount",0))
         set_state(uid, "order_city", d)
-        ui_show(chat_id, "Шаг 7/9: <b>Город/доставка</b> (пример: Кишинёв / самовывоз):", reply_markup=kb_cancel())
+        ui_show(chat_id, f"✅ Промокод принят: <b>{d['promo_discount']}%</b>\n\nШаг 8/10: <b>Город/доставка</b>:",
+                reply_markup=kb_cancel())
         return
 
     if mode == "order_city":
         d["city"] = text
         set_state(uid, "order_contact", d)
-        ui_show(chat_id, "Шаг 8/9: <b>Контакт</b>. Выберите вариант:", reply_markup=kb_contact(message.from_user))
+        ui_show(chat_id, "Шаг 9/10: <b>Контакт</b>. Выберите вариант:", reply_markup=kb_contact(message.from_user))
         return
 
     if mode == "order_contact_manual":
         d["contact"] = text
         set_state(uid, "order_note", d)
-        ui_show(chat_id, "Шаг 9/9: Комментарий (необязательно). Напишите детали или отправьте «-».", reply_markup=kb_cancel())
+        ui_show(chat_id, "Шаг 10/10: Комментарий (необязательно). Напишите детали или отправьте «-».", reply_markup=kb_cancel())
         return
 
     if mode == "order_note":
@@ -921,6 +1304,32 @@ def text_router(message):
         return start_order(chat_id, message.from_user)
     if text == "👑 Админка":
         return section_admin(chat_id, uid)
+    if text == "⭐ Лояльность":
+        return section_loyalty(chat_id, uid)
+    if text == "🎁 Скидка сегодня":
+        # ULTRA spin via reply button
+        if not promo_can_spin(uid):
+            return bot.send_message(chat_id, "😎 Ты уже крутил сегодня. Попробуй завтра.")
+        anim_mid = spin_animation(chat_id)
+        discount = promo_random_discount()
+        if discount == 0:
+            s = stats_load()
+            s["no_win"] = int(s.get("no_win",0)) + 1
+            stats_save(s)
+            try:
+                bot.edit_message_text("😢 Сегодня без скидки. Приходи завтра.", chat_id=chat_id, message_id=anim_mid)
+            except Exception:
+                bot.send_message(chat_id, "😢 Сегодня без скидки. Приходи завтра.")
+            return
+        code = promo_create(uid, discount)
+        try:
+            bot.edit_message_text(
+                f"🔥 Твоя скидка <b>{discount}%</b>\nПромокод:\n<code>{code}</code>\nДействует 24 часа.",
+                chat_id=chat_id, message_id=anim_mid, parse_mode="HTML"
+            )
+        except Exception:
+            bot.send_message(chat_id, f"🔥 Твоя скидка {discount}%\n<code>{code}</code>")
+        return
 
     return send_home(chat_id, uid)
 
@@ -953,9 +1362,7 @@ def photo_router(message):
         }
         reviews.append(entry)
         save_json(PATH_REVIEWS, reviews)
-
         forward_review_to_channel(entry)
-
         clear_state(uid)
         ui_show(chat_id, "✅ Спасибо! Отзыв (фото) сохранён.", reply_markup=kb_back_main())
         return
@@ -975,3 +1382,4 @@ bot.remove_webhook()
 time.sleep(1)
 print("BOT:", bot.get_me().username)
 bot.infinity_polling(skip_pending=True)
+
